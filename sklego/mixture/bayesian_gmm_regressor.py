@@ -88,17 +88,18 @@ class BayesianGMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         id_y = slice(X.shape[1], None)
 
         self.gmm_.fit(np.hstack((X, y)))
-        self.intercept_ = np.zeros((self.n_components, y.shape[1]))
-        self.coef_ = np.zeros((self.n_components, y.shape[1], X.shape[1]))
-        for k in range(self.n_components):
-            covYX = self.gmm_.covariances_[k, id_y, id_X]
-            precXX = pinvh(self.gmm_.covariances_[k, id_X, id_X])
-            # precXX = self.gmm_.precision[k, id_X, id_X]
-            self.coef_[k] = covYX.dot(precXX)
-            self.intercept_[k] = (
-                self.gmm_.means_[k, id_y] - self.coef_[k].dot(self.gmm_.means_[k, id_X].T)
-            )
 
+        covYX = self.gmm_.covariances_[:, id_y, id_X]
+        precXX = np.einsum(
+            "klm,knm->kln",
+            self.gmm_.precisions_cholesky_[:, id_X, id_X],
+            self.gmm_.precisions_cholesky_[:, id_X, id_X],
+        )
+
+        self.coef_ = np.einsum("klm,knm->kln", covYX, precXX)
+        self.intercept_ = self.gmm_.means_[:, id_y] - np.einsum(
+            "klm,km->kl", self.coef_, self.gmm_.means_[:, id_X]
+        )
         return self
 
     def predict(self, X):
