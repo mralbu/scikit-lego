@@ -78,11 +78,11 @@ class GMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
 
         self.joint_gmm_.fit(np.hstack((X, y)))
 
-        covYX = self.joint_gmm_.covariances_[:, id_y, id_X]
-        precXX = np.einsum("klm,knm->kln",
-            self.joint_gmm_.precisions_cholesky_[:, id_X, id_X],
-            self.joint_gmm_.precisions_cholesky_[:, id_X, id_X],
-        )
+        covariances = _get_full_matrix(self.joint_gmm_.covariances_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+        precisions_cholesky = _get_full_matrix(self.joint_gmm_.precisions_cholesky_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+
+        covYX = covariances[:, id_y, id_X]
+        precXX = np.einsum("klm,knm->kln", precisions_cholesky[:, id_X, id_X], precisions_cholesky[:, id_X, id_X])
 
         self.coef_ = np.einsum("klm,knm->kln", covYX, precXX)
         self.intercept_ = self.joint_gmm_.means_[:, id_y] - np.einsum(
@@ -115,13 +115,18 @@ class GMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
 
         id_X = slice(0, X.shape[1])
 
+        covariances = _get_full_matrix(self.joint_gmm_.covariances_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+        precisions = _get_full_matrix(self.joint_gmm_.precisions_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+        precisions_cholesky = _get_full_matrix(self.joint_gmm_.precisions_cholesky_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+
         # evaluate weights based on N(X|mean_x,sigma_x) for each component
         marginal_x_gmm = GaussianMixture(n_components=self.n_components)
         marginal_x_gmm.weights_ = self.joint_gmm_.weights_
         marginal_x_gmm.means_ = self.joint_gmm_.means_[:, id_X]
-        marginal_x_gmm.covariances_ = self.joint_gmm_.covariances_[:, id_X, id_X]
-        marginal_x_gmm.precisions_ = self.joint_gmm_.precisions_[:, id_X, id_X]
-        marginal_x_gmm.precisions_cholesky_ = self.joint_gmm_.precisions_cholesky_[:, id_X, id_X]
+        
+        marginal_x_gmm.covariances_ = covariances[:, id_X, id_X]
+        marginal_x_gmm.precisions_ = precisions[:, id_X, id_X]
+        marginal_x_gmm.precisions_cholesky_ = precisions_cholesky[:, id_X, id_X]
 
         return marginal_x_gmm.predict_proba(X)
 
@@ -149,9 +154,11 @@ class GMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         if not covariances:
             return posterior_weights, posterior_means
         else:
+            full_covariances = _get_full_matrix(self.joint_gmm_.covariances_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+
             # posterior_covariances = sigma_yy - sigma_xx^-1 . sigma_xy .sigma_yx.T
-            posterior_covariances = self.joint_gmm_.covariances_[:, id_y, id_y] - np.einsum(
-                "klm,kmn->kln", self.coef_, self.joint_gmm_.covariances_[:, id_X, id_y]
+            posterior_covariances = full_covariances[:, id_y, id_y] - np.einsum(
+                "klm,kmn->kln", self.coef_, full_covariances[:, id_X, id_y]
             )
 
             return posterior_weights, posterior_means, posterior_covariances
@@ -167,7 +174,7 @@ class GMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         X = check_array(X, estimator=self, dtype=FLOAT_DTYPES)
 
         posterior_weights, posterior_means, posterior_covariances = self.condition(X, covariances=True)
-        posterior_precisions_cholesky = _compute_precision_cholesky(posterior_covariances, self.joint_gmm_.covariance_type)
+        posterior_precisions_cholesky = _compute_precision_cholesky(posterior_covariances, 'full')
         posterior_precisions = np.einsum("klm,knm->kln", posterior_precisions_cholesky, posterior_precisions_cholesky)
 
         y = np.zeros((X.shape[0], n_samples, posterior_means.shape[1]))
@@ -197,3 +204,19 @@ class GMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         if y.ndim == 1:
             y = np.expand_dims(y, 1)
         return self.joint_gmm_.bic(np.hstack((X, y)))
+
+def _get_full_matrix(m, covariance_type, n_components_, n_features_in_):
+    if covariance_type == 'full':
+        return m
+    elif covariance_type == 'tied':
+        return np.repeat(m[np.newaxis, :], n_components_, axis=0)
+    elif covariance_type == 'diag':
+        full_m = np.zeros((n_components_, n_features_in_, n_features_in_))
+        for k in range(n_components_):
+            full_m[k] = np.diag(m[k])
+        return full_m
+    elif covariance_type == 'spherical':
+        full_m = np.zeros((n_components_, n_features_in_, n_features_in_))
+        for k in range(n_components_):
+            full_m[k] = np.diag(np.repeat(m[k], n_features_in_))
+        return full_m

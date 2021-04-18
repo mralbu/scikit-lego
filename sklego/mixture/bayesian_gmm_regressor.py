@@ -1,7 +1,7 @@
 import numpy as np
-from scipy.linalg import pinvh
 from sklearn.base import BaseEstimator, RegressorMixin, MultiOutputMixin
 from sklearn.mixture import BayesianGaussianMixture
+from sklearn.mixture._bayesian_mixture import _compute_precision_cholesky
 from sklearn.utils import check_X_y
 from sklearn.utils.validation import check_is_fitted, check_array, FLOAT_DTYPES
 
@@ -50,6 +50,7 @@ class BayesianGMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         self.verbose = verbose
         self.verbose_interval = verbose_interval
 
+
     def fit(self, X: np.array, y: np.array) -> "BayesianGMMRegressor":
         """
         Fit the model using X, y as training data.
@@ -59,12 +60,10 @@ class BayesianGMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         :return: Returns an instance of self.
         """
         X, y = check_X_y(X, y, estimator=self, dtype=FLOAT_DTYPES, multi_output=True)
-        if X.ndim == 1:
-            X = np.expand_dims(X, 1)
         if y.ndim == 1:
             y = np.expand_dims(y, 1)
 
-        self.gmm_ = BayesianGaussianMixture(
+        self.joint_gmm_ = BayesianGaussianMixture(
             n_components=self.n_components,
             covariance_type=self.covariance_type,
             tol=self.tol,
@@ -87,45 +86,140 @@ class BayesianGMMRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
         id_X = slice(0, X.shape[1])
         id_y = slice(X.shape[1], None)
 
-        self.gmm_.fit(np.hstack((X, y)))
+        self.joint_gmm_.fit(np.hstack((X, y)))
 
-        covYX = self.gmm_.covariances_[:, id_y, id_X]
-        precXX = np.einsum(
-            "klm,knm->kln",
-            self.gmm_.precisions_cholesky_[:, id_X, id_X],
-            self.gmm_.precisions_cholesky_[:, id_X, id_X],
-        )
+        covariances = _get_full_matrix(self.joint_gmm_.covariances_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+        precisions_cholesky = _get_full_matrix(self.joint_gmm_.precisions_cholesky_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+
+        covYX = covariances[:, id_y, id_X]
+        precXX = np.einsum("klm,knm->kln", precisions_cholesky[:, id_X, id_X], precisions_cholesky[:, id_X, id_X])
 
         self.coef_ = np.einsum("klm,knm->kln", covYX, precXX)
-        self.intercept_ = self.gmm_.means_[:, id_y] - np.einsum(
-            "klm,km->kl", self.coef_, self.gmm_.means_[:, id_X]
+        self.intercept_ = self.joint_gmm_.means_[:, id_y] - np.einsum(
+            "klm,km->kl", self.coef_, self.joint_gmm_.means_[:, id_X]
         )
+
         return self
 
     def predict(self, X):
-        check_is_fitted(self, ["gmm_", "coef_", "intercept_"])
+        """
+        Predict posterior mean.
+
+        :param X: array-like, shape=(n_columns, n_samples, ) training data.
+        :return: Returns posterior mean, array-like, shape=(n_samples, n_columns_y).
+        """
+
+        weights, posterior_means = self.condition(X, covariances=False)
+
+        return (posterior_means * weights[:, np.newaxis]).sum(axis=0).T
+
+    def predict_proba(self, X):
+        """
+        Predict posterior probability of each component given the data.
+
+        :param X: array-like, shape=(n_columns, n_samples, ) training data.
+        :return: Returns the probability each Gaussian (state) in the model given each sample.
+        """
+        check_is_fitted(self, ["joint_gmm_", "coef_", "intercept_"])
+        X = check_array(X, estimator=self, dtype=FLOAT_DTYPES)
+
+        id_X = slice(0, X.shape[1])
+
+        covariances = _get_full_matrix(self.joint_gmm_.covariances_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+        precisions = _get_full_matrix(self.joint_gmm_.precisions_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+        precisions_cholesky = _get_full_matrix(self.joint_gmm_.precisions_cholesky_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+
+        # evaluate weights based on N(X|mean_x,sigma_x) for each component
+        marginal_x_gmm = BayesianGaussianMixture(n_components=self.n_components)
+        marginal_x_gmm.weights_ = self.joint_gmm_.weights_
+        marginal_x_gmm.means_ = self.joint_gmm_.means_[:, id_X]
+        marginal_x_gmm.covariances_ = covariances[:, id_X, id_X]
+        marginal_x_gmm.precisions_ = precisions[:, id_X, id_X]
+        marginal_x_gmm.precisions_cholesky_ = precisions_cholesky[:, id_X, id_X]
+        marginal_x_gmm.degrees_of_freedom_ = self.joint_gmm_.degrees_of_freedom_
+        marginal_x_gmm.mean_precision_ = self.joint_gmm_.mean_precision_
+        marginal_x_gmm.weight_concentration_ = self.joint_gmm_.weight_concentration_
+        marginal_x_gmm.mean_prior_ = self.joint_gmm_.mean_prior_[id_X]
+
+        return marginal_x_gmm.predict_proba(X)
+
+    def condition(self, X, covariances=False):
+        """
+        Condition joint distribution on X.
+
+        :param X: array-like, shape=(n_samples, n_columns) training data.
+        :param covariances: bool, return posterior covariances? (default=False)
+        :return: Returns posterior_weights, posterior_means, posterior_covariances
+        """
+        check_is_fitted(self, ["joint_gmm_", "coef_", "intercept_"])
         X = check_array(X, estimator=self, dtype=FLOAT_DTYPES)
 
         id_X = slice(0, X.shape[1])
         id_y = slice(X.shape[1], None)
 
-        # evaluate weights based on N(X|mean_x,sigma_x) for each component
-        gmmX_ = BayesianGaussianMixture(n_components=self.n_components)
-        gmmX_.weights_ = self.gmm_.weights_
-        gmmX_.means_ = self.gmm_.means_[:, id_X]
-        gmmX_.covariances_ = self.gmm_.covariances_[:, id_X, id_X]
-        gmmX_.precisions_ = self.gmm_.precisions_[:, id_X, id_X]
-        gmmX_.precisions_cholesky_ = self.gmm_.precisions_cholesky_[:, id_X, id_X]
-        gmmX_.degrees_of_freedom_ = self.gmm_.degrees_of_freedom_
-        gmmX_.mean_precision_ = self.gmm_.mean_precision_
-        gmmX_.weight_concentration_ = self.gmm_.weight_concentration_
-        gmmX_.mean_prior_ = self.gmm_.mean_prior_[id_X]
-
-        weights_ = gmmX_.predict_proba(X).T
+        posterior_weights = self.predict_proba(X).T
 
         # posterior_means = mean_y + sigma_xx^-1 . sigma_xy . (x - mean_x)
-        posterior_means = self.gmm_.means_[:, id_y][:, :, np.newaxis] + np.einsum(
-            "ijk,lik->ijl", self.coef_, (X[:, np.newaxis] - self.gmm_.means_[:, id_X])
+        posterior_means = self.joint_gmm_.means_[:, id_y][:, :, np.newaxis] + np.einsum(
+            "ijk,lik->ijl", self.coef_, (X[:, np.newaxis] - self.joint_gmm_.means_[:, id_X]),
         )
 
-        return (posterior_means * weights_[:, np.newaxis]).sum(axis=0).T
+        if not covariances:
+            return posterior_weights, posterior_means
+        else:
+            full_covariances = _get_full_matrix(self.joint_gmm_.covariances_, self.covariance_type, self.n_components, self.joint_gmm_.n_features_in_)
+
+            # posterior_covariances = sigma_yy - sigma_xx^-1 . sigma_xy .sigma_yx.T
+            posterior_covariances = full_covariances[:, id_y, id_y] - np.einsum(
+                "klm,kmn->kln", self.coef_, full_covariances[:, id_X, id_y]
+            )
+
+            return posterior_weights, posterior_means, posterior_covariances
+
+    def sample(self, X, n_samples=1):
+        """
+        Sample conditional/posterior distribution given X.
+
+        :param X: array-like, shape=(n_samples, n_columns) training data.
+        :param covariances: bool, return posterior covariances? (default=False)
+        :return: Returns samples, component labels
+        """
+        X = check_array(X, estimator=self, dtype=FLOAT_DTYPES)
+
+        posterior_weights, posterior_means, posterior_covariances = self.condition(X, covariances=True)
+        posterior_precisions_cholesky = _compute_precision_cholesky(posterior_covariances, 'full')
+        posterior_precisions = np.einsum("klm,knm->kln", posterior_precisions_cholesky, posterior_precisions_cholesky)
+
+        y = np.zeros((X.shape[0], n_samples, posterior_means.shape[1]))
+        c = np.zeros((X.shape[0], n_samples))
+        for ix, _ in enumerate(X):
+            posterior_gmm = BayesianGaussianMixture(n_components=self.n_components)
+            posterior_gmm.weights_ = posterior_weights[:, ix]
+            posterior_gmm.means_ = posterior_means[:, :, ix]
+            posterior_gmm.covariances_ = posterior_covariances
+            posterior_gmm.precisions_ = posterior_precisions
+            posterior_gmm.precisions_cholesky_ = posterior_precisions_cholesky
+            # posterior_gmm.degrees_of_freedom_ = self.joint_gmm_.degrees_of_freedom_
+            # posterior_gmm.mean_precision_ = self.joint_gmm_.mean_precision_
+            # posterior_gmm.weight_concentration_ = self.joint_gmm_.weight_concentration_
+            # posterior_gmm.mean_prior_ = self.joint_gmm_.mean_prior_[id_X]
+
+            y[ix], c[ix] = posterior_gmm.sample(n_samples)
+
+        return y, c
+
+def _get_full_matrix(m, covariance_type, n_components_, n_features_in_):
+    if covariance_type == 'full':
+        return m
+    elif covariance_type == 'tied':
+        return np.repeat(m[np.newaxis, :], n_components_, axis=0)
+    elif covariance_type == 'diag':
+        full_m = np.zeros((n_components_, n_features_in_, n_features_in_))
+        for k in range(n_components_):
+            full_m[k] = np.diag(m[k])
+        return full_m
+    elif covariance_type == 'spherical':
+        full_m = np.zeros((n_components_, n_features_in_, n_features_in_))
+        for k in range(n_components_):
+            full_m[k] = np.diag(np.repeat(m[k], n_features_in_))
+        return full_m
